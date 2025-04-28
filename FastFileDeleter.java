@@ -4,8 +4,16 @@ import java.awt.event.*;
 import java.nio.file.*;
 import java.io.IOException;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.nio.file.attribute.DosFileAttributeView;
+import java.nio.file.attribute.AclFileAttributeView;
+import java.nio.file.attribute.AclEntry;
+import java.nio.file.attribute.AclEntryPermission;
+import java.nio.file.attribute.AclEntryType;
+import java.nio.file.attribute.UserPrincipal;
+import java.nio.file.attribute.UserPrincipalLookupService;
 import java.util.List;
 import java.util.ArrayList;
+import java.util.EnumSet;
 import java.beans.PropertyChangeEvent;
 import java.beans.PropertyChangeListener;
 
@@ -84,7 +92,8 @@ public class FastFileDeleter extends JFrame {
                 "Confirm Deletion",
                 JOptionPane.YES_NO_OPTION,
                 JOptionPane.WARNING_MESSAGE);
-        if (confirm != JOptionPane.YES_OPTION) return;
+        if (confirm != JOptionPane.YES_OPTION)
+            return;
 
         // Start background task
         DeleteTask task = new DeleteTask(filePath);
@@ -104,6 +113,7 @@ public class FastFileDeleter extends JFrame {
     private class DeleteTask extends SwingWorker<Void, String> {
         private Path target;
         private List<Path> filesToDelete = new ArrayList<>();
+        private List<String> deletedDetails = new ArrayList<>();
 
         public DeleteTask(Path target) {
             this.target = target;
@@ -111,23 +121,35 @@ public class FastFileDeleter extends JFrame {
 
         @Override
         protected Void doInBackground() throws Exception {
-            // First gather all files/directories
             gatherPaths(target);
             int total = filesToDelete.size();
             int count = 0;
 
-            // Delete each with progress updates
             for (Path p : filesToDelete) {
                 publish("Deleting: " + p);
                 try {
+                    // Attempt to clear DOS attributes & ACL before delete
+                    clearAttributesAndPermissions(p);
+                    // Delete file or directory
                     Files.deleteIfExists(p);
                     publish("Deleted: " + p);
+                    BasicFileAttributes attrs = Files.readAttributes(p, BasicFileAttributes.class);
+                    deletedDetails.add(String.format(
+                            "Name: %s\nPath: %s\nSize: %d bytes\n",
+                            p.getFileName(), p.toAbsolutePath(), attrs.size()));
                 } catch (IOException ex) {
-                    publish("Error deleting " + p + ": " + ex.getMessage());
+                    // Fallback to system command
+                    try {
+                        Process proc = new ProcessBuilder("cmd", "/c", "del", "/f", "/q", p.toString()).start();
+                        proc.waitFor();
+                        publish("Force-deleted via cmd: " + p);
+                        deletedDetails.add("Force-deleted via cmd: " + p);
+                    } catch (Exception cmdEx) {
+                        publish("Error deleting " + p + ": " + ex.getMessage());
+                    }
                 }
                 count++;
-                int progress = (int) ((count / (double) total) * 100);
-                setProgress(progress);
+                setProgress((int) (count * 100.0 / total));
             }
             return null;
         }
@@ -140,6 +162,7 @@ public class FastFileDeleter extends JFrame {
                         filesToDelete.add(file);
                         return FileVisitResult.CONTINUE;
                     }
+
                     @Override
                     public FileVisitResult postVisitDirectory(Path dir, IOException exc) {
                         filesToDelete.add(dir);
@@ -148,6 +171,35 @@ public class FastFileDeleter extends JFrame {
                 });
             } else {
                 filesToDelete.add(start);
+            }
+        }
+
+        private void clearAttributesAndPermissions(Path p) {
+            try {
+                DosFileAttributeView dosView = Files.getFileAttributeView(p, DosFileAttributeView.class);
+                if (dosView != null) {
+                    dosView.setReadOnly(false);
+                    dosView.setHidden(false);
+                    dosView.setSystem(false);
+                }
+            } catch (IOException ignored) {
+            }
+
+            try {
+                AclFileAttributeView aclView = Files.getFileAttributeView(p, AclFileAttributeView.class);
+                if (aclView != null) {
+                    UserPrincipalLookupService lookup = p.getFileSystem().getUserPrincipalLookupService();
+                    UserPrincipal everyone = lookup.lookupPrincipalByName("Everyone");
+                    AclEntry entry = AclEntry.newBuilder()
+                            .setType(AclEntryType.ALLOW)
+                            .setPrincipal(everyone)
+                            .setPermissions(EnumSet.of(AclEntryPermission.DELETE, AclEntryPermission.WRITE_ACL))
+                            .build();
+                    List<AclEntry> acl = new ArrayList<>(aclView.getAcl());
+                    acl.add(0, entry);
+                    aclView.setAcl(acl);
+                }
+            } catch (IOException ignored) {
             }
         }
 
@@ -160,12 +212,39 @@ public class FastFileDeleter extends JFrame {
 
         @Override
         protected void done() {
-            progressBar.setValue(100);
+            setProgress(100);
             historyModel.addElement("Deletion complete.");
-            JOptionPane.showMessageDialog(FastFileDeleter.this,
-                    "All operations finished.", "Done", JOptionPane.INFORMATION_MESSAGE);
-            deleteButton.setEnabled(true);
+
+            String[] options = { "OK", "Details" };
+            int choice = JOptionPane.showOptionDialog(
+                    FastFileDeleter.this,
+                    "All operations finished.",
+                    "Done",
+                    JOptionPane.DEFAULT_OPTION,
+                    JOptionPane.INFORMATION_MESSAGE,
+                    null,
+                    options,
+                    options[0]);
+
+            if (choice == 1) {
+                JTextArea textArea = new JTextArea();
+                textArea.setEditable(false);
+                for (String d : deletedDetails) {
+                    textArea.append(d + "\n");
+                }
+                JScrollPane scroll = new JScrollPane(textArea);
+                scroll.setPreferredSize(new Dimension(500, 300));
+                JOptionPane.showMessageDialog(
+                        FastFileDeleter.this,
+                        scroll,
+                        "Deleted File Details",
+                        JOptionPane.INFORMATION_MESSAGE);
+            }
+
+            progressBar.setValue(0);
+            historyModel.clear();
             pathField.setText("");
+            deleteButton.setEnabled(true);
         }
     }
 
